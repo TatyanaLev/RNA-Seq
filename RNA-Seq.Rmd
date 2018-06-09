@@ -1,0 +1,328 @@
+---
+title: 'RNA-seq & Differential Gene Expression: Hematopoietic Stem Cells vs. Erythroblasts'
+---
+##### for: "PSU/STAT555-2017"
+## Abstract
+
+RNA-seq data was analyzed using R for differential gene expression between hematopietic stem cells and erythroblasts using EdgeR and Voom (Limma). Data was normalized, analyzed for differential expression, and adjusted for multiple-testing to identify genes that are most differentially expressed. Voom identified around 4 times more genes than EdgeR. Those identified with EdgeR, 90% were confirmed by Voom. In top-10 most highly expressed genes of either method, 3 were identified in common. I looked up the GO function of these genes to see which functions are enriched in the cells as they differentiate from heme stem cells to erythroblasts. The identified genes are involved in essential erythrocyte functions such as metal ion binding, and in metabolic pathways known to be important in red cell differentiation. 
+
+## Intro: Scientific background and questions to be addressed
+
+High-throughput biology experiments usually require advanced statistical analyses to make sense of the results. RNA-seq is one such high-throughput method increasingly used in biology today which requires statistical testing. RNA-seq is a sequencing-based method used to assess transcriptional changes between samples. I used hematopoietic stem cells (HSC) and the more differentiated cell type Erythroblast (ERT) and measured the differences in their gene expressions.
+
+This analysis sought to answer the following questions:
+* 1. What genes are differentially expressed between HSC and ERT?
+* 2. How consistent are the results across the two experimental methods?
+* 3. What are the enriched functions of the genes with differential expression patterns?
+
+## Data source 
+
+HSC and ERT samples are from mouse cell lines, from Penn State's Hardison Lab, located in a public database, https://www.encodeproject.org. I downloaded these RNA-seq .tsv files and created a TPM counts matrix. There are 2 replicates from 2 Library preparation methods ScriptSeq and TotalScript that researchers used.
+
+## Methods: creating TPM (transcripts per million) counts matrix
+
+```{r}
+# set working directory and identify files for import
+wdir=getwd()
+setwd("/Users/x2127151/edu/stat555/FINAL/rawTSVs")
+source('countsMatrix.r') #runs script for making 1 counts matrix from 8 seperate RNA-seq files and writing the matrix as HemeSeq.csv for input
+
+#read in the counts matrix
+HemeSeq <- read.table(file='HemeSeq.tsv')
+head(HemeSeq)
+```
+
+For clarity: my TPM column names are derived from .tsv files that are either Erythroblast (ERT) or Heme Stem Cell (HSC), prepared by ScriptSeq (_SS) or TotalScript (_TS), and 1/2 refers to the repliate number 1 or 2: 
+
+* ERT_SS1 example: Erythroblast / ScriptSeq / 1
+* ERT_SS2
+* ERT_TS1
+* ERT_TS2
+* HSC_SS1 
+* HSC_SS2
+* HSC_TS1
+* HSC_TS2 example: Heme Stem Cell / TotalScript / 2
+
+## Methods: Understanding the data, and cleaning it up
+
+#### Remove as many of low-TPM and zero data as possible 
+
+```{r}
+# create rowSums for HSC
+HSC.sum <- rowSums(HemeSeq[,5:6]) 
+ 
+# remove rows that have TPM <0.1 in HSC. The 0.1 TPM was chosen for row sum to remove as many of low-TPM and zero data as possible 
+HemeSeq <- HemeSeq[HSC.sum>=0.1, ]
+
+# create rowSums for ERT
+ERT.sum <- rowSums(HemeSeq[,1:4])
+
+# remove rows that have TPM <0.1 in ERT
+HemeSeq <- HemeSeq[ERT.sum>=0.1, ]
+
+dim(HemeSeq) #13049 rows remaining
+```
+
+#### Check that all libraries are essentially the same size
+
+```{r}
+libSz <- colSums(HemeSeq)
+barplot(libSz)
+```
+
+#### Look at TPM Distributions  
+
+```{r}
+par(mfrow=c(2,4))
+for (i in 1:8) hist(log2(HemeSeq[,i]),xlab=colnames(HemeSeq)[i])
+```
+
+The histograms of TPM across samples show that distributions are similar; however-- for ERT, distributions center around zero, and for HSC the peak shifts to the right somewhat.
+
+#### Look at Scatterplot Matrix to see if data has correlations/biases
+
+HSCs appear less correlated than ERTs. More dispersion in these. Perhaps this says that the more pluripotent the cells, the more diversely expressing they are from one to the next, whereas more committed cells (erythroblasts) are more similar to each other.
+
+```{r}
+library(hexbin)
+plot(hexplom(log2(HemeSeq[,1:4]+0.1), xlab="Erythroblasts"))
+plot(hexplom(log2(HemeSeq[,5:8]+0.1), xlab="Heme Stem Cells")) 
+```
+
+HSCs appear less correlated than ERTs. More dispersion in these. Perhaps this says that the more pluripotent the cells, the more diversely expressing they are from one to the next, whereas more committed cells (erythroblasts) are more similar to each other.
+
+#### Perform basic cluster analysis to verify that samples group as expected 
+
+```{r}
+par(mfrow=c(1,1))
+HS <- (HemeSeq+0.1) 
+dist <- as.dist(1-cor(HS))
+plot(hclust(dist), main = "Erythroblast & Heme Stem Cell Cluster Dendrogram")
+```
+
+The samples cluster by replicate, then by library preparation method. This shows that library preparation method has more of an effect on sample clustering than the type of sample that was prepared. This suggests that overall, ERTs and HSC, are not fundamentally different as far as TPM counts go, and that library prep method has an effect.
+
+#### Identify the most highly expressed genes and their abundance overall
+
+```{r}
+genSum <- rowSums(HemeSeq)
+totTPM <- sum(libSz)
+lgGenes <- sort((genSum/totTPM)*100,decreasing = T) # genes sorted by expression order
+head(lgGenes, n=10)
+sum(lgGenes[1:10])
+```
+
+The ten most highly epressed genes take over 55% of sequence space. This seems high, considering that there are 13049 genes total here. This is just FYI to keep in mind.
+
+## Methods: Differential Expression Analysis with **edgeR**
+
+#### Normalize the data and identify its distribution type
+
+```{r}
+#load necessary libraries
+library(edgeR)
+library(limma)
+library(qvalue)
+```
+
+```{r}
+#TMM normalization
+trts <- substr(colnames(HemeSeq),1,3)
+dHS <- DGEList(counts=HemeSeq, group=trts,genes=rownames(HemeSeq))
+dHS <- calcNormFactors(dHS,method="TMM")
+#dispersion
+dHS <- estimateCommonDisp(dHS)
+dHS$common.dispersion
+
+```
+
+The common dispersion is >0, meaning that there is extra-Poisson distribution in the data. Considering that current data is from stem cells, which have a lot of diverse expression potential, perhaps this makes sense. 
+
+#### Selecting tagwise dispersion
+
+Because there is a lot of variation within genes and between genes, we need to perform a correction. To select the most appropriate one, I looked at several:
+
+```{r}
+
+dHS0 <- estimateTagwiseDisp(dHS,prior=0)
+dHS4 <- estimateTagwiseDisp(dHS,prior=4)
+dHS10 <- estimateTagwiseDisp(dHS,prior=10)
+dHS20 <- estimateTagwiseDisp(dHS,prior=20)
+dHS40 <- estimateTagwiseDisp(dHS,prior=40)
+boxplot(dHS0$tagwise.dispersion,dHS4$tagwise.dispersion,dHS10$tagwise.dispersion,dHS20$tagwise.dispersion,dHS40$tagwise.dispersion,
+names=paste(c(0,4,10,20,40)))
+```
+
+Comparing to other RNA-seq analyses, the "prior" of 20 here is similar to the prior of 10 in others, so I will use this prior = 20 for downstream analysis here.
+
+#### Exact Test & p-values
+
+This test computes genewise difference in means; it can be used for over-dispersed data according to R documentation on EdgeR  
+
+```{r}
+edgeERTvHSC <- exactTest(dHS20,pair=c("ERT","HSC"))
+#p-value histogram
+edgePVals <- edgeERTvHSC$table[,3]
+hist(edgePVals, n=50)
+```
+
+Histogram of p-values does show more p-values closer to 0 than is usual for the other points along the 0-1 interval, with the notable exception of p-values of 1.0. Ideally the p-values close to 0 would be much higher, and 1.0 values would be lower than they are here. 
+
+#### Multiple testing adjustment: q-values
+
+```{r}
+edgeQ <- qvalue(edgePVals)
+edgeQ$pi0 # proportion of genes not differentially expressed
+sum(edgeQ$qvalues<0.001) # number of genes with q<0.01 -- differentially expressed
+```
+
+There appears to be very little/none differential expression in the data, as pi0 is 1. Considering this, I lowered my q threshold to 0.001
+443 genes are below this threshold and are therefore likely differentially expressed between HSC and ERT.
+
+## Results: Most Differentially Expressed Genes from EdgeR Analysis
+
+```{r}
+# 10 lowest Q-values
+edgeGenes <- edgeERTvHSC$genes
+foldChangeR <- edgeERTvHSC$table[,1]
+mergeColsR <- cbind(edgeERTvHSC$genes,foldChangeR,edgeQ$qvalues, HemeSeq)
+sortGenesR <- mergeColsR[order(mergeColsR[,3]),]
+colnames(sortGenesR)  <- c("genes", "fold change", "q-value", "ERT_SS1", "ERT_SS2", "ERT_TS1", "ERT_TS2", "HSC_SS1", "HSC_SS2","HSC_TS1", "HSC_TS2")
+head(sortGenesR, n=10)
+```
+
+The top-10 genes identified make sense based on TPM counts, as HSC TPMs are orders of magnitude lower than ERT. Interestingly, All the DE genes are in Erythroblasts, not Heme Stem Cells.
+
+******
+
+## Methods: Differential Expression Analysis with **Voom**
+
+#### Data normalization and preparation of "Design Matrix"
+
+Data was not re-normalized from scratch for voom, rather the normalized data prepared with edgeR (dHS) was used here.
+
+```{r}
+designV <- model.matrix(~0+dHS$samples$group)
+colnames(designV) <- levels(dHS$samples$group)
+```
+
+#### Voom analysis: weights for linear modeling
+
+```{r}
+vHS <- voom(dHS,designV,plot=TRUE)
+```
+
+#### Fitting Linear Model and calculating eBayes Contrasts
+
+```{r}
+HemeSeqfit <- lmFit(vHS,designV)
+HScontrastMatrix <- makeContrasts(ERTvsHSC=ERT-HSC, levels=designV)
+HemeSeqContrast <- contrasts.fit(HemeSeqfit,HScontrastMatrix)
+HemeSeqEfitContrast <- eBayes(HemeSeqContrast)
+```
+
+#### p-values
+
+```{r}
+voomPVals <- HemeSeqEfitContrast$p.v
+hist(voomPVals, main = "Histogram of p-values for Voom")
+```
+
+Histogram of p-values looks as expected; appropriate for multiple-testing adjustments.
+
+#### Multiple testing adjustment: q-values
+
+```{r}
+voomQ <- qvalue(voomPVals)
+voomQ$pi0 # proportion of genes not differentially expressed
+sum(voomQ$qvalues<0.001) # number of genes with q<0.001 -- differentially expressed
+```
+
+## Results: Most Differentially Expressed Genes from Voom Analysis
+
+```{r}
+#10 lowest q-values
+voomGenes <- HemeSeqEfitContrast$genes
+foldChangeV <- HemeSeqEfitContrast$coefficients
+mergeColsV <- cbind(voomGenes,foldChangeV,voomQ$qvalues, HemeSeq)
+sortGenesV <- mergeColsV[order(mergeColsV[,3]),]
+colnames(sortGenesV) <- c("genes", "fold change", "q-value", "ERT_SS1", "ERT_SS2", "ERT_TS1", "ERT_TS2", "HSC_SS1", "HSC_SS2","HSC_TS1", "HSC_TS2")  # rename columns!
+head(sortGenesV, n=10)
+```
+
+Again, the top-10 genes identified make sense based on TPM counts, as HSC TPMs are orders of magnitude lower than ERT. Also again, all the DE genes are in Erythroblasts.
+
+## Results: Comparing the two Analysis Methods 
+
+```{r}
+vennDiagram(vennCounts(cbind(edgeQ$q<=0.001,voomQ$q<=0.001)),
+names=c("EdgeR","Voom"))
+
+402/(402+41)*100 # percentage of EdgeR agreeing with Voom
+```
+
+As expected, based on analyses performed on Rat data in homeworks, Voom identified many more differentially expressing genes in Erythroblasts than EdgeR did. I was skeptical of EdgeR results because the p-values histogram looked suboptimal, with many 1.0 p-values, but the fact that over 90% of genes identified by EdgeR were also identified by Voom speaks to the accuracy of the analysis. It is also possible that the EdgeR normalization (used for both EdgeR and Voom) produced these concordant results.
+
+************
+************
+************
+
+## Results: Enriched Functions of Differentially Expressed Genes
+
+I manually searched databases, looking for GO terms BP (biological processes), MF (molecular function), CC (celular components).
+
+There are 3 genes in common between edgeR and Voom in their top-10 most differentially expressing genes, all protein-coding:
+
+#### Gene: Cd36 (ENSMUSG00000002944.11)
+
+* GO-BP: (68), mostly involved in regulatory functions
+* GO-MF: (8), most of which are involved in lipoprotein binding
+* GO-CC: throughout the cell
+
+#### Gene: Snca (ENSMUSG00000025889.9)
+
+* GO-BP: (73), several of which are involved in *metal ion* response, *oxidation-reduction*, *heme-component* response, metabolic process regulatin
+* GO-MF: (26), several of which are involved in *ion binding*, and *oxidoreductase activity*
+* GO-CC: throughout the cell
+
+#### Gene: Ypel4 (ENSMUSG00000034059.9) 
+
+* GO-BP: Not Determined
+* GO-MF: *metal ion binding*
+* GO-CC: nucleus, nucleolus
+
+***********
+
+## Discussion: Do my results make sense?
+
+Cd36 gene is listed as a gene involved in erythrocyte differentiation in the article by Chen et al for this project. The other 2 genes, Snca and Ypel4, have erythrocytic functions such as metal ion binding or response, and oxidation-reduction functions. It makes sense that Snca and Ypel4 are differentially expressed in erythroblasts; since relevant genes got identified,  my analysis appears valid. 
+
+#### Future work and things learned
+
+Most surprising thing I learned was how profound of an effect library preparation method has on how end data looks. When I clustered data, samples clustered based on ScriptSeq vs TotalScript (library prep methods) before clustering based on cell line type! I will keep this in mind in the lab for next time that we decide on which kit to use for one method or another.       
+
+***********
+
+# Bibliography: 
+
+Gene Ontologies for the 3 genes identified in common by edgeR and Voom 
+
+Cd36:
+http://www.ensembl.org/Mus_musculus/Gene/Ontologies/molecular_function?g=ENSMUSG00000002944;r=5:17781690-17888801
+
+Snca:
+http://www.ensembl.org/Mus_musculus/Gene/Ontologies/molecular_function?g=ENSMUSG00000025889;r=6:60731575-60829855
+
+Ypel4:
+http://www.ensembl.org/Mus_musculus/Gene/Ontologies/molecular_function?g=ENSMUSG00000034059;r=2:84734058-84738655
+
+& papers and labs supplied in the STAT555 course reading list from Penn State University
+
+***************
+
+### SessionInfo
+
+```{r sessionInfo}
+toLatex(sessionInfo())
+print(gc())
+```
